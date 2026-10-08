@@ -1,0 +1,21 @@
+import { test, expect } from '@playwright/test';
+import { fixture, login, query, recommendAndSubmit } from './helpers';
+test('成功后响应超时先显示未知，原号核对成功且仅一单', async ({ page }) => {
+  const account = fixture('SUCCESS_TIMEOUT');
+  await login(page);
+  await page.getByRole('button', { name: '新建套餐咨询' }).click();
+  await query(page, account.number);
+  await recommendAndSubmit(page);
+  await expect(page.getByTestId('acceptance-status')).toHaveText('结果未知，请核对');
+  const sid = new URL(page.url()).searchParams.get('id');
+  const before = (await (await page.request.get(`/api/v1/acceptances?service_id=${sid}`)).json()).items[0];
+  await page.reload();
+  await page.getByRole('button', { name: '按原请求号核对' }).click();
+  await expect(page.getByTestId('acceptance-status')).toHaveText('办理成功');
+  const after = (await (await page.request.get(`/api/v1/acceptances?service_id=${sid}`)).json()).items;
+  expect(after).toHaveLength(1);
+  expect(after[0].external_request_id).toBe(before.external_request_id);
+  const external = await page.request.get(`http://127.0.0.1:8002/mock/v1/acceptances/by-request/${before.external_request_id}`, { headers: { Authorization: 'Bearer ' + process.env.BOSS_TOKEN } });
+  expect((await external.json()).external_order_id).toBe(after[0].external_order_id);
+  await page.screenshot({ path: '../.local/e2e-unknown-result.png', fullPage: true });
+});

@@ -1,0 +1,55 @@
+import { useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Alert, Button, Card, Form, Input, Select, Table, Tag, Typography } from 'antd';
+import { api } from '../../lib/api';
+import { date, label, money } from '../../lib/display';
+import type { Earning } from '../../lib/business';
+import type { User } from '../auth/LoginPage';
+
+type Rule = { id: string; business_type: string; version: number; status: string; valid_from: string; valid_to: string; fixed_amount: string; rate: string; employee_rate: string; settlement_condition: string };
+type Bill = { id: string; source: string; period: string; created_at: string; items: { id: string; business_no: string; amount: string; received_amount: string; status: string; original: unknown }[] };
+
+function EarningDetail({ row }: { row: Earning }) {
+  return <><p>原收益 {money(row.expected_amount)} · 调整后 {money(row.adjusted_expected)} · 已结算提成 {money(row.settled_commission)} · 可发或扣回 {money(row.available_commission)}</p><p>已知到账合计 {money(row.known_received)}，另有 {row.unknown_receipts} 笔到账金额未知。</p>
+    <Table rowKey="id" pagination={false} dataSource={row.bill_periods} columns={[{ title:'到账账期',dataIndex:'period' },{ title:'本期应收',dataIndex:'amount',render:money },{ title:'实际到账',dataIndex:'received_amount',render:money },{ title:'账单范围',dataIndex:'is_final',render:v=>v?'最终结算 / 修正':'分期账单' }]} />
+    <Table rowKey="id" pagination={false} dataSource={row.adjustments} columns={[{ title:'调整期',dataIndex:'period' },{ title:'收益差额',dataIndex:'expected_delta',render:money },{ title:'提成差额',dataIndex:'commission_delta',render:money },{ title:'原因',dataIndex:'reason' },{ title:'依据',render:(_,r)=><a href={r.after_sale_id?`/aftersales?id=${r.after_sale_id}`:r.reversal_id?`/reversals?id=${r.reversal_id}`:`/settlements?case_id=${r.case_id}`}>原处理单</a> }]} />
+    <details><summary>冻结的计算规则与业务来源</summary><pre>{JSON.stringify(row.snapshot,null,2)}</pre></details></>;
+}
+
+export function FinancePage({ user }: { user: User }) {
+  const cache = useQueryClient();
+  const evidenceId = new URLSearchParams(location.search).get('id');
+  const evidence = useQuery({ queryKey: ['earning-evidence', evidenceId], queryFn: () => api<Earning>(`/finance/earnings/${evidenceId}`), enabled: !!evidenceId });
+  const [period, setPeriod] = useState(new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0,7));
+  const [manualKey, setManualKey] = useState(() => crypto.randomUUID()), [mockKey, setMockKey] = useState(() => crypto.randomUUID());
+  const rules = useQuery({ queryKey: ['earning-rules'], queryFn: () => api<{ items: Rule[] }>('/finance/rules') });
+  const sources = useQuery({ queryKey: ['earning-sources'], queryFn: () => api<{ items: { source_type: string; source_id: string; label: string }[] }>('/finance/sources') });
+  const earnings = useQuery({ queryKey: ['earnings', period], queryFn: () => api<{ items: Earning[] }>(`/finance/earnings?period=${period}`) });
+  const bills = useQuery({ queryKey: ['bills'], queryFn: () => api<{ items: Bill[] }>('/finance/bills') });
+  const refresh = async () => { await Promise.all(['earning-rules','earnings','bills','earning-sources'].map(k => cache.invalidateQueries({ queryKey: [k] }))); };
+  const write = useMutation({ mutationFn: ({ path, body }: { path: string; body: object }) => api(path, body), onSuccess: refresh });
+  const importManual = useMutation({ mutationFn: (v: { period: string; source: string; rows: { business_no: string; amount: string; received_amount?: string; earning_period?: string; line_key?: string; is_final?: boolean }[] }) => api('/finance/bills', { ...v, request_key: manualKey, rows: v.rows.map(r => ({ ...r, received_amount: r.received_amount || null, earning_period:r.earning_period || null,line_key:r.line_key || 'PRIMARY',is_final:r.is_final ?? true })) }), onSuccess: async () => { setManualKey(crypto.randomUUID()); await refresh(); } });
+  const importMock = useMutation({ mutationFn: () => api('/finance/bills/from-mock', { period, request_key: mockKey }), onSuccess: async () => { setMockKey(crypto.randomUUID()); await refresh(); } });
+  const preview = useMutation({ mutationFn: () => api<{ rows: { business_no: string; amount: string; received_amount: string }[]; definition: string }>(`/finance/mock-bill?period=${period}`) });
+  const error = rules.error || sources.error || earnings.error || bills.error || write.error || importManual.error || importMock.error || preview.error || evidence.error;
+  return <div className="stack">{error && <Alert type="error" title={error.message} />}
+    {evidence.data && <Card title="当前引用的收益依据"><p>{evidence.data.period} · {label(evidence.data.source_type)} · {label(evidence.data.match_status)}</p><Typography.Paragraph copyable>{evidence.data.business_no}</Typography.Paragraph><EarningDetail row={evidence.data} /></Card>}
+    <Card title="收益与待结算提成" extra={<Input aria-label="收益账期" type="month" value={period} onChange={e => { if (e.target.value) setPeriod(e.target.value); }} style={{ width: 160 }} />}>
+      <Typography.Paragraph type="secondary">按业务归属期查看原收益；展开查看跨期账单、退款调整和已发提成。当前应收以后台列出的当前结算期为准，实际发放在“结算与差异”登记。</Typography.Paragraph>
+      <Table rowKey="id" dataSource={earnings.data?.items} scroll={{ x: 1100 }} expandable={{ expandedRowRender: r => <EarningDetail row={r} /> }} columns={[{ title: '业务', dataIndex: 'source_type', render: label }, { title: '外部业务号', dataIndex: 'business_no', render: v => <Typography.Text copyable>{v}</Typography.Text> }, { title: '原预估', dataIndex: 'expected_amount', render: money },{ title:'调整后',dataIndex:'adjusted_expected',render:money }, { title: '当前应收', render:(_,r)=><>{r.due_period}<br />{money(r.current_due)}</> }, { title: '实际到账', dataIndex: 'actual_received', render: money }, { title: '对账', dataIndex: 'match_status', render: label }, { title: '可发 / 扣回提成', dataIndex: 'available_commission', render: money }, { title: '结算条件', dataIndex: 'settleable', render: v => <Tag color={v ? 'green' : 'orange'}>{v ? '有可发余额' : '待核查或已结算'}</Tag> }]} />
+      <Form layout="inline" onFinish={v => { const [source_type, source_id] = v.source_key.split(':'); write.mutate({ path: '/finance/accruals', body: { source_type, source_id } }); }}><Form.Item name="source_key" label="已完成业务" rules={[{ required: true }]}><Select showSearch optionFilterProp="label" style={{ width: 360 }} options={sources.data?.items.map(s => ({ value: `${s.source_type}:${s.source_id}`, label: s.label }))} /></Form.Item><Button htmlType="submit" loading={write.isPending}>生成收益记录</Button></Form>
+    </Card>
+    <Card title="模拟账单"><Button loading={preview.isPending} onClick={() => preview.mutate()}>预览当前账期外部账单</Button> <Button type="primary" loading={importMock.isPending} onClick={() => importMock.mutate()}>导入当前账期模拟账单</Button>
+      {preview.data && <><p>{preview.data.definition}</p><Table rowKey="business_no" dataSource={preview.data.rows} columns={[{ title: '业务号', dataIndex: 'business_no' }, { title: '账单应付', dataIndex: 'amount', render: money }, { title: '到账', dataIndex: 'received_amount', render: money }]} /></>}
+      <Table rowKey="id" dataSource={bills.data?.items} expandable={{ expandedRowRender: b => <Table rowKey="id" dataSource={b.items} expandable={{ expandedRowRender: i => <pre>{JSON.stringify(i.original, null, 2)}</pre> }} columns={[{ title: '外部业务号', dataIndex: 'business_no' }, { title: '账单金额', dataIndex: 'amount', render: money }, { title: '到账金额', dataIndex: 'received_amount', render: money }, { title: '匹配结果', dataIndex: 'status', render: label }]} /> }} columns={[{ title: '账期', dataIndex: 'period' }, { title: '来源', dataIndex: 'source' }, { title: '导入时间', dataIndex: 'created_at', render: date }, { title: '行数', render: (_, b) => b.items.length }]} />
+    </Card>
+    <Card title="人工录入模拟账单"><Form layout="vertical" initialValues={{ period, source: '人工录入模拟账单', rows: [{ amount: '0.00', received_amount: '' }] }} onFinish={importManual.mutate}>
+      <div className="grid"><Form.Item name="period" label="账期" rules={[{ required: true }]}><Input type="month" /></Form.Item><Form.Item name="source" label="账单来源说明" rules={[{ required: true }]}><Input /></Form.Item></div>
+      <Form.List name="rows">{(fields, { add, remove }) => <>{fields.map(f => <div className="grid" key={f.key}><Form.Item name={[f.name,'business_no']} label="外部业务号" rules={[{ required: true }]}><Input /></Form.Item><Form.Item name={[f.name,'earning_period']} label="业务归属期（留空为同账期）"><Input type="month" /></Form.Item><Form.Item name={[f.name,'line_key']} label="原账单行号（同月补单须填写不同原行号）"><Input /></Form.Item><Form.Item name={[f.name,'is_final']} label="是否最终结算"><Select options={[{ value:true,label:'最终结算或修正' },{ value:false,label:'后续仍有分期' }]} /></Form.Item><Form.Item name={[f.name,'amount']} label="账单应付（冲回可填负数）" rules={[{ required: true }]}><Input /></Form.Item><Form.Item name={[f.name,'received_amount']} label="实际到账（留空表示未知）"><Input /></Form.Item><Button onClick={() => remove(f.name)} disabled={fields.length === 1}>删除行</Button></div>)}<Button onClick={() => add({ amount: '0.00', received_amount: '',is_final:true })}>增加账单行</Button></>}</Form.List><Button htmlType="submit" type="primary" loading={importManual.isPending} style={{ margin: 16 }}>保存并匹配账单</Button>
+    </Form></Card>
+    <Card title="收益规则版本"><Table rowKey="id" dataSource={rules.data?.items} columns={[{ title: '业务类型', dataIndex: 'business_type', render: label }, { title: '版本', dataIndex: 'version' }, { title: '状态', dataIndex: 'status', render: label }, { title: '固定收益', dataIndex: 'fixed_amount', render: money }, { title: '业务金额比例', dataIndex: 'rate' }, { title: '员工提成比例', dataIndex: 'employee_rate' }, { title: '结算条件', dataIndex: 'settlement_condition', render: label }, { title: '操作', render: (_, r) => r.status === 'DRAFT' && user.role === 'ADMIN' ? <Button onClick={() => write.mutate({ path: `/finance/rules/${r.id}/publish`, body: {} })}>发布规则</Button> : '保留历史版本' }]} /></Card>
+    {user.role === 'ADMIN' && <Card title="新建收益规则草稿"><Form layout="vertical" initialValues={{ business_type: 'SALE', fixed_amount: '0.00', rate: '0.10', employee_rate: '0.20', settlement_condition: 'BILL_MATCHED', valid_from: '2026-01-01', valid_to: '2027-12-31' }} onFinish={v => write.mutate({ path: '/finance/rules', body: v })}>
+      <div className="grid"><Form.Item name="business_type" label="业务类型"><Select options={['SALE','TELECOM','INSTALLATION'].map(value => ({ value, label: label(value) }))} /></Form.Item><Form.Item name="fixed_amount" label="每笔固定收益"><Input /></Form.Item><Form.Item name="rate" label="经营类实收比例（0 至 1）"><Input /></Form.Item><Form.Item name="employee_rate" label="收益中的员工提成比例（0 至 1）"><Input /></Form.Item><Form.Item name="settlement_condition" label="可结算条件"><Select options={['SOURCE_COMPLETE','BILL_MATCHED'].map(value => ({ value, label: label(value) }))} /></Form.Item><Form.Item name="valid_from" label="生效日"><Input type="date" /></Form.Item><Form.Item name="valid_to" label="截止日"><Input type="date" /></Form.Item></div><Button htmlType="submit" loading={write.isPending}>保存规则草稿</Button>
+    </Form></Card>}
+  </div>;
+}

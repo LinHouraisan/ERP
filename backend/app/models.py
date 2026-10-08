@@ -1,0 +1,19 @@
+from app.modules.auth import models as auth
+from app.modules.catalog import models as catalog
+from app.modules.accounts import models as accounts
+from app.modules.services import models as services
+from app.modules.recommendations import models as recommendations
+from app.modules.quality import models as quality
+from app.modules.queue import models as queue
+from app.modules.acceptances import models as acceptances
+from app.modules.feedback import models as feedback
+from app.modules.improvements import models as improvements
+from app.modules.evaluations import models as evaluations
+from app.modules.inventory import models as inventory
+from app.modules.sales import models as sales
+from app.modules.installations import models as installations
+from app.modules.finance import models as finance
+from app.modules.operations import models as operations
+from app.modules.aftersales import models as aftersales
+from app.modules.transactions import models as transactions
+from app.modules.inventory import transfers_models

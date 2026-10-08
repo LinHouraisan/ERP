@@ -1,0 +1,50 @@
+import { useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Alert, Button, Card, Descriptions, Form, Input, InputNumber, Select, Table } from 'antd';
+import { api } from '../../lib/api';
+import { date, label, money } from '../../lib/display';
+import type { Order } from '../../lib/business';
+import type { User } from '../auth/LoginPage';
+
+type Case = { id: string; order_id: string; kind: string; reason: string; status: string; refund_status: string; amount: string; stock_processed: boolean; service_resolution: string; external_request_id: string; last_error: string | null; created_at: string;
+  lines: { line_id: string; refund_amount: string; return_quantity: number; snapshot: { name: string; tracking: string } }[]; events: { action: string; at: string; detail: unknown }[] };
+const kinds = [{ value: 'RETURN_REFUND', label: '已交付商品退货退款' }, { value: 'REFUND_ONLY', label: '仅退金额，商品不退库' }, { value: 'CANCEL_UNSHIPPED', label: '取消未交付商品或服务' }];
+export const serialList = (text?: string) => (text || '').split(/[\s,，]+/).filter(Boolean);
+
+export function AftersalesPage({ user }: { user: User }) {
+  const cache = useQueryClient(), [params, setParams] = useSearchParams(), [form] = Form.useForm();
+  const id = params.get('id'), selectedOrder = Form.useWatch('order_id', form) || params.get('order_id');
+  const kind = Form.useWatch('kind', form) || 'REFUND_ONLY';
+  const manager = ['MANAGER','ADMIN'].includes(user.role), canCreate = ['STAFF','MANAGER','ADMIN'].includes(user.role);
+  const [key, setKey] = useState(() => crypto.randomUUID());
+  const rows = useQuery({ queryKey: ['aftersales'], queryFn: () => api<{ items: Case[] }>('/aftersales') });
+  const detail = useQuery({ queryKey: ['aftersale', id], queryFn: () => api<Case>(`/aftersales/${id}`), enabled: !!id });
+  const orders = useQuery({ queryKey: ['orders'], queryFn: () => api<{ items: Order[] }>('/sales/orders'), enabled: canCreate });
+  const source = useQuery({ queryKey: ['order', selectedOrder], queryFn: () => api<Order>(`/sales/orders/${selectedOrder}`), enabled: canCreate && !!selectedOrder });
+  const refresh = async () => { await Promise.all(['aftersales','aftersale','orders','order','stock','earnings','todos','transactions'].map(k => cache.invalidateQueries({ queryKey: [k] }))); };
+  const write = useMutation({ mutationFn: ({ path, body }: { path: string; body: object }) => api<Case>(path, body), onSuccess: refresh });
+  const create = useMutation({ mutationFn: (v: { order_id: string; kind: string; reason: string; scenario: string; lines: { line_id: string; refund_amount: string; return_quantity: number }[] }) => api<Case>('/aftersales', { ...v, request_key: key, lines: v.lines.map(l => ({ ...l, return_quantity: v.kind === 'REFUND_ONLY' ? 0 : l.return_quantity || 0 })) }), onSuccess: async r => { setParams({ id: r.id }); setKey(crypto.randomUUID()); await refresh(); } });
+  const row = detail.data, error = rows.error || detail.error || orders.error || source.error || write.error || create.error;
+  return <div className="stack">{error && <Alert title={error.message} type="error" />}
+    <Card title="售后与退款" extra={<Button onClick={() => void refresh()}>刷新售后</Button>}><Table rowKey="id" dataSource={rows.data?.items} columns={[{ title: '申请原因', dataIndex: 'reason' }, { title: '金额', dataIndex: 'amount', render: money }, { title: '审批', dataIndex: 'status', render: label }, { title: '退款', dataIndex: 'refund_status', render: v => v === 'NONE' ? '未提交' : label(v) }, { title: '实物处理', render: (_, r) => r.stock_processed ? '已处理' : '待核对 / 无退货' }, { title: '操作', render: (_, r) => <Button onClick={() => setParams({ id: r.id })}>打开售后</Button> }]} /></Card>
+    {row && <Card title={`售后 ${row.id.slice(0,8)}`}><Descriptions items={[{ key: 'kind', label: '方式', children: kinds.find(k => k.value === row.kind)?.label }, { key: 'source', label: '原单', children: <a href={`/sales?id=${row.order_id}`}>查看原收款与商品</a> }, { key: 'amount', label: '申请退款', children: money(row.amount) }, { key: 'time', label: '申请时间', children: date(row.created_at) }]} />
+      <p>{row.reason}</p>{row.last_error && <Alert type="warning" title={row.last_error} />}<Table pagination={false} rowKey="line_id" dataSource={row.lines} columns={[{ title: '原商品 / 服务', render: (_, r) => r.snapshot.name }, { title: '退款', dataIndex: 'refund_amount', render: money }, { title: '退货 / 取消数量', dataIndex: 'return_quantity' }]} />
+      {manager && row.status === 'REQUESTED' && <Form name="aftersale-review" layout="inline" initialValues={{ decision: 'APPROVE' }} onFinish={v => write.mutate({ path: `/aftersales/${row.id}/review`, body: v })}><Form.Item name="decision" label="审批结果"><Select options={[{ value: 'APPROVE', label: '批准' }, { value: 'REJECT', label: '驳回' }]} style={{ width: 110 }} /></Form.Item><Form.Item name="note" label="审批依据" rules={[{ required: true, whitespace: true }]}><Input /></Form.Item><Button htmlType="submit" loading={write.isPending}>提交审批</Button></Form>}
+      {row.status === 'APPROVED' && <div className="stack">
+        {manager && !row.service_resolution && <details><summary>原单已履约服务的人工处理</summary><Form name="aftersale-service" onFinish={v => write.mutate({ path: `/aftersales/${row.id}/service-resolution`, body: v })}><Form.Item name="note" label="履约事实、补偿依据与处理结果" rules={[{ required: true, whitespace: true }]}><Input.TextArea /></Form.Item><Button htmlType="submit" loading={write.isPending}>记录人工处理依据</Button></Form></details>}
+        {['WAREHOUSE','MANAGER','ADMIN'].includes(user.role) && row.kind === 'RETURN_REFUND' && !row.stock_processed && row.refund_status !== 'FAILED' && <Card size="small" title="实物验收入库"><Form name="aftersale-receive" key={row.id} onFinish={v => write.mutate({ path: `/aftersales/${row.id}/receive`, body: { note: v.note, lines: row.lines.filter(l => l.return_quantity > 0).map(l => ({ line_id: l.line_id, serials: serialList(v.serials?.[l.line_id]) })) } })}>
+          {row.lines.filter(l => l.return_quantity > 0 && l.snapshot.tracking === 'SERIAL').map(l => <Form.Item key={l.line_id} name={['serials', l.line_id]} label={`${l.snapshot.name} · 退回 ${l.return_quantity} 台的原序列号`} rules={[{ required: true }]}><Input.TextArea placeholder="每行一个原订单设备序列号" /></Form.Item>)}<Form.Item name="note" label="验收情况" rules={[{ required: true, whitespace: true }]}><Input /></Form.Item><Button htmlType="submit" loading={write.isPending}>确认退货入库</Button></Form></Card>}
+        {['FINANCE','MANAGER','ADMIN'].includes(user.role) && !['SUCCESS','FAILED'].includes(row.refund_status) && <Button loading={write.isPending} type="primary" onClick={() => write.mutate({ path: `/aftersales/${row.id}/${row.refund_status === 'NONE' ? 'refund' : 'reconcile'}`, body: {} })}>{row.refund_status === 'NONE' ? '提交模拟退款' : '按原退款号核对'}</Button>}
+        {manager && row.refund_status === 'SUCCESS' && <Form name="aftersale-close" layout="inline" onFinish={v => write.mutate({ path: `/aftersales/${row.id}/close`, body: v })}><Form.Item name="note" label="结案依据" rules={[{ required: true, whitespace: true }]}><Input /></Form.Item><Button htmlType="submit" loading={write.isPending}>核对退款与实物后结案</Button></Form>}
+        {manager && row.refund_status === 'FAILED' && <Form name="aftersale-failed" layout="vertical" onFinish={v=>write.mutate({ path:`/aftersales/${row.id}/resolve-failure`,body:v })}><Form.Item name="replacement_after_sale_id" label="已成功结案的后续退款（已退库时必选）" rules={row.stock_processed?[{ required:true }]:[]}><Select allowClear options={rows.data?.items.filter(c=>c.order_id===row.order_id && c.status==='CLOSED' && c.refund_status==='SUCCESS').map(c=>({ value:c.id,label:`${c.reason} · ${c.amount} 元` }))} /></Form.Item><Form.Item name="note" label="失败核实、客户决定与后续处理依据" rules={[{ required:true,whitespace:true }]}><Input.TextArea /></Form.Item><Button htmlType="submit" loading={write.isPending}>保留失败结果并结束本次申请</Button></Form>}
+      </div>}
+      <p>退款请求号：{row.external_request_id}</p><details><summary>审批与处理记录</summary>{row.events.map((e,i) => <p key={i}>{date(e.at)} · {label(e.action)} · {JSON.stringify(e.detail)}</p>)}</details>
+    </Card>}
+    {canCreate && <Card title="从原收款单申请售后"><Form name="aftersale-create" form={form} layout="vertical" initialValues={{ order_id: params.get('order_id') || undefined, kind: 'REFUND_ONLY', scenario: 'NORMAL', lines: [{}] }} onFinish={create.mutate}>
+      <Form.Item name="order_id" label="成功收款的原订单" rules={[{ required: true }]}><Select showSearch optionFilterProp="label" onChange={() => form.setFieldValue('lines', [{}])} options={orders.data?.items.filter(o => o.payment?.status === 'SUCCESS').map(o => ({ value: o.id, label: `${o.lines.map(l => l.snapshot.name).join('、')} · ${o.id.slice(0,8)}` }))} /></Form.Item>
+      <Form.Item name="kind" label="售后方式"><Select options={kinds} /></Form.Item><Form.List name="lines">{(fields, { add, remove }) => <>{fields.map(f => <div className="grid" key={f.key}><Form.Item name={[f.name,'line_id']} label="原单商品或服务" rules={[{ required: true }]}><Select options={source.data?.lines.map(l => ({ value: l.id, label: `${l.snapshot.name} · 剩余可退 ${l.refundable_amount ?? l.amount} 元 / ${l.returnable_quantity ?? l.quantity} 件` }))} /></Form.Item><Form.Item name={[f.name,'refund_amount']} label="本次退款金额" rules={[{ required: true }]}><Input /></Form.Item>{kind !== 'REFUND_ONLY' && <Form.Item name={[f.name,'return_quantity']} label="商品退回或取消数量（服务填 0）"><InputNumber min={0} precision={0} /></Form.Item>}<Button onClick={() => remove(f.name)} disabled={fields.length === 1}>移除此行</Button></div>)}<Button onClick={() => add({ return_quantity: 0 })}>增加售后行</Button></>}</Form.List>
+      <Form.Item name="reason" label="申请原因" rules={[{ required: true, whitespace: true }]}><Input.TextArea /></Form.Item><Form.Item name="scenario" label="模拟退款情形"><Select options={[{ value: 'NORMAL', label: '正常退款' }, { value: 'SUCCESS_TIMEOUT', label: '成功后返回超时' }, { value: 'DECLINED', label: '模拟拒绝' }]} /></Form.Item><Button htmlType="submit" type="primary" loading={create.isPending}>提交售后申请</Button>
+    </Form></Card>}
+  </div>;
+}
